@@ -4,7 +4,7 @@ terraform {
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "~> 3.75.0"
+      version = "~> 4.0"  # ← שונה מ-3.75.0 ל-4.0
     }
   }
 }
@@ -124,13 +124,13 @@ resource "azurerm_cognitive_account" "openai" {
 }
 
 resource "azurerm_cognitive_deployment" "gpt4" {
-  name                 = "gpt-4"
+  name                 = "gpt-4o-mini"
   cognitive_account_id = azurerm_cognitive_account.openai.id
   
   model {
     format  = "OpenAI"
-    name    = "gpt-4"
-    version = "0613"
+    name    = "gpt-4o-mini"
+    version = "2024-07-18"
   }
   
   scale {
