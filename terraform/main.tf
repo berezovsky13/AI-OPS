@@ -175,12 +175,6 @@ resource "azurerm_key_vault_secret" "redis_password" {
   ]
 }
 
-# ==================== RBAC ====================
-resource "azurerm_role_assignment" "aks_openai" {
-  principal_id         = azurerm_kubernetes_cluster.main.kubelet_identity[0].object_id
-  role_definition_name = "Cognitive Services User"
-  scope                = azurerm_cognitive_account.openai.id
-}
 
 # ==================== Outputs ====================
 output "resource_group_name" {
