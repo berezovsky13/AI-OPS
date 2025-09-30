@@ -4,17 +4,13 @@ terraform {
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "~> 4.0"  # ← שונה מ-3.75.0 ל-4.0
+      version = "~> 4.0"
     }
   }
 }
 
 provider "azurerm" {
   features {}
-  
-  skip_provider_registration = true
-  
-  # Credentials will be taken from Azure CLI or environment variables
 }
 
 # ==================== Variables ====================
@@ -32,12 +28,11 @@ variable "location" {
 
 # ==================== Locals ====================
 locals {
-  resource_prefix = "chatbot-${var.candidate_name}"
+  resource_prefix     = "chatbot-${var.candidate_name}"
   resource_group_name = "platform_candidate_${var.candidate_name}"
 }
 
 # ==================== Resource Group ====================
-# Use existing RG or create if doesn't exist
 data "azurerm_resource_group" "main" {
   name = local.resource_group_name
 }
@@ -70,21 +65,21 @@ resource "azurerm_kubernetes_cluster" "main" {
   location            = data.azurerm_resource_group.main.location
   resource_group_name = data.azurerm_resource_group.main.name
   dns_prefix          = "${local.resource_prefix}-aks"
-  
+
   default_node_pool {
-    name                = "default"
-    node_count          = 2
-    vm_size             = "Standard_D2s_v3"
-    vnet_subnet_id      = azurerm_subnet.aks.id
-    enable_auto_scaling = true
-    min_count           = 2
-    max_count           = 5
+    name                 = "default"
+    vm_size              = "Standard_D2s_v3"
+    vnet_subnet_id       = azurerm_subnet.aks.id
+    auto_scaling_enabled = true
+    min_count            = 2
+    max_count            = 5
+    node_count           = 2
   }
-  
+
   identity {
     type = "SystemAssigned"
   }
-  
+
   network_profile {
     network_plugin    = "azure"
     load_balancer_sku = "standard"
@@ -101,12 +96,12 @@ resource "azurerm_redis_cache" "main" {
   capacity            = 1
   family              = "C"
   sku_name            = "Standard"
-  
-  enable_non_ssl_port = false
-  minimum_tls_version = "1.2"
-  
+
+  non_ssl_port_enabled = false
+  minimum_tls_version  = "1.2"
+
   redis_configuration {
-    enable_authentication = true
+    authentication_enabled = "true"
   }
 }
 
@@ -117,7 +112,7 @@ resource "azurerm_cognitive_account" "openai" {
   resource_group_name = data.azurerm_resource_group.main.name
   kind                = "OpenAI"
   sku_name            = "S0"
-  
+
   identity {
     type = "SystemAssigned"
   }
@@ -126,15 +121,16 @@ resource "azurerm_cognitive_account" "openai" {
 resource "azurerm_cognitive_deployment" "gpt4" {
   name                 = "gpt-4o-mini"
   cognitive_account_id = azurerm_cognitive_account.openai.id
-  
+
   model {
     format  = "OpenAI"
     name    = "gpt-4o-mini"
     version = "2024-07-18"
   }
-  
-  scale {
-    type = "Standard"
+
+  sku {
+    name     = "Standard"
+    capacity = 1
   }
 }
 
@@ -149,9 +145,9 @@ resource "azurerm_key_vault" "main" {
   sku_name                   = "standard"
   soft_delete_retention_days = 7
   purge_protection_enabled   = false
-  
+
   network_acls {
-    default_action = "Allow"  # Simplified for assignment
+    default_action = "Allow"
     bypass         = "AzureServices"
   }
 }
@@ -161,7 +157,7 @@ resource "azurerm_key_vault_access_policy" "aks" {
   key_vault_id = azurerm_key_vault.main.id
   tenant_id    = data.azurerm_client_config.current.tenant_id
   object_id    = azurerm_kubernetes_cluster.main.kubelet_identity[0].object_id
-  
+
   secret_permissions = [
     "Get",
     "List"
@@ -173,14 +169,13 @@ resource "azurerm_key_vault_secret" "redis_password" {
   name         = "redis-password"
   value        = azurerm_redis_cache.main.primary_access_key
   key_vault_id = azurerm_key_vault.main.id
-  
+
   depends_on = [
     azurerm_key_vault_access_policy.aks
   ]
 }
 
 # ==================== RBAC ====================
-# AKS to OpenAI
 resource "azurerm_role_assignment" "aks_openai" {
   principal_id         = azurerm_kubernetes_cluster.main.kubelet_identity[0].object_id
   role_definition_name = "Cognitive Services User"
