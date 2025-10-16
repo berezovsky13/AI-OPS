@@ -22,7 +22,7 @@ provider "azurerm" {
 variable "candidate_name" {
   description = "Candidate identifier used for resource naming"
   type        = string
-  default     = "x"
+  default     = "7"
 }
 
 variable "location" {
@@ -40,7 +40,7 @@ variable "environment" {
 variable "allowed_ip_ranges" {
   description = "List of IP CIDR ranges allowed to access Key Vault"
   type        = list(string)
-  default     = ["141.226.88.60/32"]  # ✅ ה-IP שלך
+  default     = ["141.226.88.60/32"]
 }
 
 variable "kubernetes_version" {
@@ -89,6 +89,12 @@ variable "pe_subnet_prefix" {
   description = "Address prefix for private endpoints subnet"
   type        = list(string)
   default     = ["10.0.3.0/24"]
+}
+
+variable "appgw_subnet_prefix" {
+  description = "Address prefix for Application Gateway subnet"
+  type        = list(string)
+  default     = ["10.0.4.0/24"]
 }
 
 variable "aks_service_cidr" {
@@ -223,6 +229,17 @@ resource "azurerm_subnet" "private_endpoints" {
   }
 }
 
+resource "azurerm_subnet" "appgw" {
+  name                 = "appgw-subnet"
+  resource_group_name  = data.azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.main.name
+  address_prefixes     = var.appgw_subnet_prefix
+
+  lifecycle {
+    ignore_changes = [delegation]
+  }
+}
+
 resource "azurerm_network_security_group" "aks" {
   name                = "${local.resource_prefix}-aks-nsg"
   location            = data.azurerm_resource_group.main.location
@@ -311,6 +328,173 @@ resource "azurerm_subnet_network_security_group_association" "aks" {
   network_security_group_id = azurerm_network_security_group.aks.id
 }
 
+# ==================== Application Gateway ====================
+resource "azurerm_public_ip" "appgw" {
+  name                = "${local.resource_prefix}-appgw-pip"
+  location            = data.azurerm_resource_group.main.location
+  resource_group_name = data.azurerm_resource_group.main.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+  zones               = ["1", "2", "3"]
+
+  tags = local.common_tags
+}
+
+resource "azurerm_web_application_firewall_policy" "main" {
+  name                = "${local.resource_prefix}-waf-policy"
+  location            = data.azurerm_resource_group.main.location
+  resource_group_name = data.azurerm_resource_group.main.name
+
+  policy_settings {
+    enabled                     = true
+    mode                        = "Prevention"
+    request_body_check          = true
+    file_upload_limit_in_mb     = 100
+    max_request_body_size_in_kb = 128
+  }
+
+  managed_rules {
+    managed_rule_set {
+      type    = "OWASP"
+      version = "3.2"
+    }
+  }
+
+  tags = local.common_tags
+}
+
+resource "azurerm_user_assigned_identity" "appgw" {
+  name                = "${local.resource_prefix}-appgw-identity"
+  location            = data.azurerm_resource_group.main.location
+  resource_group_name = data.azurerm_resource_group.main.name
+
+  tags = local.common_tags
+}
+
+resource "azurerm_application_gateway" "main" {
+  name                = "${local.resource_prefix}-appgw"
+  location            = data.azurerm_resource_group.main.location
+  resource_group_name = data.azurerm_resource_group.main.name
+  enable_http2        = true
+  zones               = ["1", "2", "3"]
+  firewall_policy_id  = azurerm_web_application_firewall_policy.main.id
+
+  sku {
+    name     = "WAF_v2"
+    tier     = "WAF_v2"
+    capacity = 2
+  }
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.appgw.id]
+  }
+
+  gateway_ip_configuration {
+    name      = "appgw-ip-config"
+    subnet_id = azurerm_subnet.appgw.id
+  }
+
+  frontend_port {
+    name = "frontend-port-80"
+    port = 80
+  }
+
+  frontend_port {
+    name = "frontend-port-443"
+    port = 443
+  }
+
+  frontend_ip_configuration {
+    name                 = "frontend-ip-config"
+    public_ip_address_id = azurerm_public_ip.appgw.id
+  }
+
+  backend_address_pool {
+    name = "aks-backend-pool"
+  }
+
+  backend_http_settings {
+    name                  = "backend-http-settings"
+    cookie_based_affinity = "Disabled"
+    port                  = 80
+    protocol              = "Http"
+    request_timeout       = 60
+    probe_name            = "health-probe"
+  }
+
+  http_listener {
+    name                           = "http-listener"
+    frontend_ip_configuration_name = "frontend-ip-config"
+    frontend_port_name             = "frontend-port-80"
+    protocol                       = "Http"
+  }
+
+  request_routing_rule {
+    name                       = "routing-rule-http"
+    rule_type                  = "Basic"
+    http_listener_name         = "http-listener"
+    backend_address_pool_name  = "aks-backend-pool"
+    backend_http_settings_name = "backend-http-settings"
+    priority                   = 100
+  }
+
+  probe {
+    name                                      = "health-probe"
+    protocol                                  = "Http"
+    path                                      = "/health"
+    interval                                  = 30
+    timeout                                   = 30
+    unhealthy_threshold                       = 3
+    pick_host_name_from_backend_http_settings = false
+    host                                      = "127.0.0.1"
+    
+    match {
+      status_code = ["200-399"]
+    }
+  }
+
+  tags = local.common_tags
+
+  lifecycle {
+    ignore_changes = [
+      backend_address_pool,
+      backend_http_settings,
+      http_listener,
+      probe,
+      request_routing_rule,
+      tags
+    ]
+  }
+
+  depends_on = [
+    azurerm_public_ip.appgw,
+    azurerm_subnet.appgw
+  ]
+}
+
+resource "azurerm_monitor_diagnostic_setting" "appgw" {
+  name                       = "${local.resource_prefix}-appgw-diag"
+  target_resource_id         = azurerm_application_gateway.main.id
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.main.id
+
+  enabled_log {
+    category = "ApplicationGatewayAccessLog"
+  }
+
+  enabled_log {
+    category = "ApplicationGatewayPerformanceLog"
+  }
+
+  enabled_log {
+    category = "ApplicationGatewayFirewallLog"
+  }
+
+  enabled_metric {
+    category = "AllMetrics"
+  }
+}
+
 # ==================== AKS ====================
 resource "azurerm_kubernetes_cluster" "main" {
   name                = "${local.resource_prefix}-aks"
@@ -360,6 +544,10 @@ resource "azurerm_kubernetes_cluster" "main" {
     secret_rotation_interval = "2h"
   }
 
+  ingress_application_gateway {
+    gateway_id = azurerm_application_gateway.main.id
+  }
+
   tags = local.common_tags
 
   lifecycle {
@@ -369,6 +557,10 @@ resource "azurerm_kubernetes_cluster" "main" {
       kubernetes_version
     ]
   }
+
+  depends_on = [
+    azurerm_application_gateway.main
+  ]
 }
 
 resource "azurerm_monitor_diagnostic_setting" "aks" {
@@ -589,7 +781,6 @@ resource "azurerm_key_vault" "main" {
   }
 }
 
-# Key Vault access for current user/deployer
 resource "azurerm_key_vault_access_policy" "deployer" {
   key_vault_id = azurerm_key_vault.main.id
   tenant_id    = data.azurerm_client_config.current.tenant_id
@@ -629,7 +820,6 @@ resource "azurerm_key_vault_access_policy" "deployer" {
   ]
 }
 
-# Key Vault access for AKS
 resource "azurerm_key_vault_access_policy" "aks" {
   key_vault_id = azurerm_key_vault.main.id
   tenant_id    = data.azurerm_client_config.current.tenant_id
@@ -641,7 +831,6 @@ resource "azurerm_key_vault_access_policy" "aks" {
   ]
 }
 
-# Key Vault access for AKS Key Vault Secrets Provider
 resource "azurerm_key_vault_access_policy" "aks_secrets_provider" {
   key_vault_id = azurerm_key_vault.main.id
   tenant_id    = data.azurerm_client_config.current.tenant_id
@@ -653,7 +842,6 @@ resource "azurerm_key_vault_access_policy" "aks_secrets_provider" {
   ]
 }
 
-# Store Redis password
 resource "azurerm_key_vault_secret" "redis_password" {
   name         = "redis-password"
   value        = azurerm_redis_cache.main.primary_access_key
@@ -664,7 +852,6 @@ resource "azurerm_key_vault_secret" "redis_password" {
   ]
 }
 
-# Store Redis connection string
 resource "azurerm_key_vault_secret" "redis_connection_string" {
   name         = "redis-connection-string"
   value        = "${azurerm_redis_cache.main.hostname}:${azurerm_redis_cache.main.ssl_port},password=${azurerm_redis_cache.main.primary_access_key},ssl=True,abortConnect=False"
@@ -675,7 +862,6 @@ resource "azurerm_key_vault_secret" "redis_connection_string" {
   ]
 }
 
-# Store OpenAI endpoint
 resource "azurerm_key_vault_secret" "openai_endpoint" {
   name         = "openai-endpoint"
   value        = azurerm_cognitive_account.openai.endpoint
@@ -686,7 +872,6 @@ resource "azurerm_key_vault_secret" "openai_endpoint" {
   ]
 }
 
-# Store OpenAI API key
 resource "azurerm_key_vault_secret" "openai_key" {
   name         = "openai-api-key"
   value        = azurerm_cognitive_account.openai.primary_access_key
@@ -926,4 +1111,19 @@ output "aks_identity_principal_id" {
 output "aks_secrets_provider_identity" {
   value       = azurerm_kubernetes_cluster.main.key_vault_secrets_provider[0].secret_identity[0].object_id
   description = "AKS Key Vault Secrets Provider identity"
+}
+
+output "appgw_public_ip" {
+  value       = azurerm_public_ip.appgw.ip_address
+  description = "Application Gateway public IP address"
+}
+
+output "appgw_name" {
+  value       = azurerm_application_gateway.main.name
+  description = "Application Gateway name"
+}
+
+output "waf_policy_id" {
+  value       = azurerm_web_application_firewall_policy.main.id
+  description = "WAF Policy ID"
 }
