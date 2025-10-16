@@ -1,0 +1,180 @@
+name: Deploy Chatbot to Azure
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  CANDIDATE_NAME: x
+  AZURE_REGION: eastus
+
+jobs:
+  terraform:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      aks_name: ${{ steps.tf_output.outputs.aks_name }}
+      redis_host: ${{ steps.tf_output.outputs.redis_host }}
+      openai_endpoint: ${{ steps.tf_output.outputs.openai_endpoint }}
+      key_vault_name: ${{ steps.tf_output.outputs.key_vault_name }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+        terraform_wrapper: false
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: |
+          {
+            "clientId": "`${{ secrets.AZURE_CLIENT_ID }}",
+            "clientSecret": "`${{ secrets.AZURE_CLIENT_SECRET }}",
+            "subscriptionId": "`${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+            "tenantId": "`${{ secrets.AZURE_TENANT_ID }}"
+          }
+
+    - name: Terraform Init
+      working-directory: ./terraform
+      run: terraform init
+      env:
+        ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+    - name: Terraform Plan
+      working-directory: ./terraform
+      run: terraform plan -out=tfplan
+      env:
+        ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+    - name: Terraform Apply
+      working-directory: ./terraform
+      run: terraform apply -auto-approve tfplan
+      env:
+        ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+    - name: Get Terraform Outputs
+      id: tf_output
+      working-directory: ./terraform
+      run: |
+        echo "aks_name=`$(terraform output -raw aks_cluster_name)" >> `$GITHUB_OUTPUT
+        echo "redis_host=`$(terraform output -raw redis_hostname)" >> `$GITHUB_OUTPUT
+        echo "openai_endpoint=`$(terraform output -raw openai_endpoint)" >> `$GITHUB_OUTPUT
+        echo "key_vault_name=`$(terraform output -raw key_vault_name)" >> `$GITHUB_OUTPUT
+      env:
+        ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+  build-and-deploy:
+    name: Build and Deploy Application
+    runs-on: ubuntu-latest
+    needs: terraform
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Login to ACR
+      uses: docker/login-action@v3
+      with:
+        registry: acrcandidates.azurecr.io
+        username: ${{ secrets.ACR_USERNAME }}
+        password: ${{ secrets.ACR_PASSWORD }}
+
+    - name: Build and Push Docker Image
+      run: |
+        docker build -f Dockerfile-simple -t acrcandidates.azurecr.io/chatbot:`${{ github.sha }} .
+        docker build -f Dockerfile-simple -t acrcandidates.azurecr.io/chatbot:latest .
+        docker push acrcandidates.azurecr.io/chatbot:`${{ github.sha }}
+        docker push acrcandidates.azurecr.io/chatbot:latest
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: |
+          {
+            "clientId": "`${{ secrets.AZURE_CLIENT_ID }}",
+            "clientSecret": "`${{ secrets.AZURE_CLIENT_SECRET }}",
+            "subscriptionId": "`${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+            "tenantId": "`${{ secrets.AZURE_TENANT_ID }}"
+          }
+
+    - name: Get AKS Credentials
+      run: |
+        az aks get-credentials \
+          --resource-group platform_candidate_`${{ env.CANDIDATE_NAME }} \
+          --name `${{ needs.terraform.outputs.aks_name }} \
+          --overwrite-existing
+
+    - name: Create ACR Secret
+      run: |
+        kubectl create secret docker-registry acr-secret \
+          --docker-server=acrcandidates.azurecr.io \
+          --docker-username=`${{ secrets.ACR_USERNAME }} \
+          --docker-password=`${{ secrets.ACR_PASSWORD }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Deploy to AKS
+      run: |
+        kubectl apply -f k8s/deployment-simple.yaml
+        kubectl rollout status deployment/chatbot --timeout=5m
+
+    - name: Get Service Endpoint
+      run: |
+        echo " Waiting for LoadBalancer IP..."
+        for i in {1..30}; do
+          EXTERNAL_IP=`$(kubectl get service chatbot-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          if [ ! -z "`$EXTERNAL_IP" ]; then
+            echo " Chatbot is available at: http://`$EXTERNAL_IP"
+            echo "CHATBOT_URL=http://`$EXTERNAL_IP" >> `$GITHUB_ENV
+            break
+          fi
+          echo "Still waiting... (`$i/30)"
+          sleep 10
+        done
+
+    - name: Test Deployment
+      run: |
+        sleep 30
+        EXTERNAL_IP=`$(kubectl get service chatbot-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        if [ ! -z "`$EXTERNAL_IP" ]; then
+          echo " Testing health endpoint..."
+          curl -f http://`$EXTERNAL_IP/health || echo " Health check pending..."
+          
+          echo " Testing root endpoint..."
+          curl -f http://`$EXTERNAL_IP/ || echo " Root endpoint pending..."
+        else
+          echo " No external IP yet. Check: kubectl get svc chatbot-service"
+        fi
+
+    - name: Deployment Summary
+      run: |
+        echo "##  Deployment Complete!" >> `$GITHUB_STEP_SUMMARY
+        echo "" >> `$GITHUB_STEP_SUMMARY
+        echo "###  Resources" >> `$GITHUB_STEP_SUMMARY
+        echo "- **AKS Cluster**: `${{ needs.terraform.outputs.aks_name }}" >> `$GITHUB_STEP_SUMMARY
+        echo "- **Redis**: `${{ needs.terraform.outputs.redis_host }}" >> `$GITHUB_STEP_SUMMARY
+        echo "- **OpenAI**: `${{ needs.terraform.outputs.openai_endpoint }}" >> `$GITHUB_STEP_SUMMARY
+        echo "" >> `$GITHUB_STEP_SUMMARY
+        EXTERNAL_IP=`$(kubectl get service chatbot-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        if [ ! -z "`$EXTERNAL_IP" ]; then
+          echo "###  Chatbot URL" >> `$GITHUB_STEP_SUMMARY
+          echo "http://`$EXTERNAL_IP" >> `$GITHUB_STEP_SUMMARY
+        fi
